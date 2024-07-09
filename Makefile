@@ -11,10 +11,10 @@ ASMFLAGS=-asmflags "all=-trimpath ${PWD}"
 
 DEPS=vendor/modules.txt main.go
 
-.PHONY: all clean vendor
+.PHONY: all clean vendor test
 
 
-all: evrcat evrcat.exe
+all: test evrcat evrcat.exe
 
 vendor/modules.txt: go.mod go.sum
 	GOWORK=off go mod vendor
@@ -27,6 +27,8 @@ evrcat: $(DEPS)
 evrcat.exe: $(DEPS)
 	GOWORK=off GOOS=windows go build -o evrcat.exe -trimpath -mod=vendor ${GCFLAGS} ${LDFLAGS} main.go
 
+test:
+	GOWORK=off go test -v ./...
+
 clean:
 	rm -f evrcat evrcat.exe
-
