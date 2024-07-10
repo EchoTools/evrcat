@@ -2,65 +2,145 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"os"
-	"regexp"
-	"strings"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
 
+	"github.com/echotools/evrcat/cat"
 	"github.com/heroiclabs/nakama/v3/server/evr"
+	bolt "go.etcd.io/bbolt"
 )
 
 var (
 	version  = "dev"
 	commitID = "none"
 
-	flags = Flags{}
+	HashBucketName = []byte("hashes")
 
-	symbolPattern = regexp.MustCompile(`0x[0-9a-fA-F]{16}`)
+	flags = Flags{}
 )
 
 // Define flags
 type Flags struct {
-	showHelp    bool
-	showVersion bool
-	reverseMode bool
-	uppercase   bool
+	showHelp         bool
+	showVersion      bool
+	reverseMode      bool
+	uppercase        bool
+	databasePath     string
+	updateDB         bool
+	files            []string
+	serverListenPort string
 }
 
-func main() {
-
-	versionInfo := fmt.Sprintf("%s %s", version, commitID)
+func parseFlags() {
 	// Initialize flags
 	flag.BoolVar(&flags.showHelp, "help", false, "Display help information")
-	flag.BoolVar(&flags.reverseMode, "reverse", false, "Reverse mode: replace tokens with hashes")
-	flag.BoolVar(&flags.uppercase, "uppercase", false, "Uppercase hexadecimal numbers")
-	flag.BoolVar(&flags.showVersion, "version", false, fmt.Sprintf("Display version information: %s", versionInfo))
+	flag.BoolVar(&flags.reverseMode, "reverse", false, "Replace tokens with hashes")
+	flag.StringVar(&flags.databasePath, "db-path", "~/.cache/evrcat/lookup.db", "Path to the cache database file")
+	flag.BoolVar(&flags.updateDB, "update-db", false, "Update the database (only works with --reverse)")
+	flag.BoolVar(&flags.uppercase, "uppercase", false, "Use uppercase hexadecimal strings")
+	flag.StringVar(&flags.serverListenPort, "server", "", "Run as a server on PORT (reverse not supported)")
+	flag.BoolVar(&flags.showVersion, "version", false, "Display version")
 	flag.Parse()
 
 	if flags.showHelp {
-		fmt.Println("Usage: evrcat [OPTION]... [FILE]...")
-		fmt.Println("\nConcatenate FILE(s) to standard output, replacing hexadecimal numbers with tokens.")
-		fmt.Println("")
-		fmt.Println("With no FILE, or when FILE is -, read standard input.")
-		fmt.Println("")
-		fmt.Println("--help: Display help information")
-		fmt.Println("--version: Display version information")
-
+		fmt.Fprintln(os.Stderr, "Usage: evrcat [OPTION]... [FILE]...")
+		fmt.Fprintln(os.Stderr, "Concatenate FILE(s) to standard output, replacing hashes with tokens.")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "With no FILE, or when FILE is -, read standard input.")
+		fmt.Fprintln(os.Stderr, "")
+		flag.Usage()
+		fmt.Fprintln(os.Stderr, "")
 		os.Exit(0)
 	}
 
 	if flags.showVersion {
-		fmt.Printf("evrcat %s, commit %s\n", version, commitID)
+		fmt.Fprintln(os.Stdout, version)
 		os.Exit(0)
 	}
 
-	files := flag.Args()
-	if len(files) == 0 {
-		files = append(files, "-")
+	if flags.serverListenPort != "" {
+		// Build the map from the built-in symbol cache
+		hashmap := make(map[string]string, len(evr.SymbolCache))
+		for k, v := range evr.SymbolCache {
+			hashmap[k.HexString()] = string(v)
+			hashmap[k.HexStringUpper()] = string(v)
+		}
+		fmt.Fprintf(os.Stderr, "Loaded %d entries from built-in symbol cache\n", len(hashmap))
+
+		server := cat.NewEVRCatServer(hashmap)
+		server.Start(flags.serverListenPort)
 	}
 
-	for _, file := range files {
+	flags.files = flag.Args()
+	if len(flags.files) == 0 {
+		flags.files = append(flags.files, "-")
+	}
+
+}
+
+func main() {
+	var err error
+	parseFlags()
+
+	// The hash map is only populated if the user wants to update the database.
+	var hashmap map[evr.Symbol]evr.SymbolToken
+	var db *bolt.DB
+
+	if flags.databasePath != "" {
+		if db, err = openDB(flags.databasePath); err != nil {
+			fmt.Fprintln(os.Stderr, "Error opening database:", err.Error())
+		}
+		hashmap, err = readDB(db)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading database:", err.Error())
+		}
+
+		fmt.Fprintln(os.Stderr, "Using database at", flags.databasePath)
+		fmt.Printf("Database contains %d entries\n", len(hashmap))
+
+	}
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-c
+		if db != nil {
+			// If reversing values, then update the cache with new values
+			if flags.updateDB && flags.reverseMode {
+				if err := updateDB(db, hashmap); err != nil {
+					fmt.Fprintln(os.Stderr, "Error updating database:", err.Error())
+				}
+			}
+			if err := closeDB(db); err != nil {
+				fmt.Fprintln(os.Stderr, "Error closing database:", err.Error())
+			}
+		}
+		os.Exit(0)
+	}()
+
+	cat := cat.NewEVRCat()
+
+	if flags.reverseMode && flags.updateDB {
+		// Start with the built-in symbol cache
+		hashmap, err = readDB(db)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading database:", err.Error())
+			os.Exit(1)
+		}
+		// Update the map with the built-in symbol cache
+		for k, v := range evr.SymbolCache {
+			hashmap[k] = v
+		}
+	}
+
+	for _, file := range flags.files {
 		var scanner *bufio.Scanner
 		if file == "-" {
 			scanner = bufio.NewScanner(os.Stdin)
@@ -68,7 +148,7 @@ func main() {
 
 			file, err := os.Open(file)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error opening file `%s`: %s", file.Name(), err.Error())
+				fmt.Fprintln(os.Stderr, "Error opening file:", file.Name(), err.Error())
 				continue
 			}
 			defer file.Close()
@@ -78,49 +158,107 @@ func main() {
 		for scanner.Scan() {
 			line := scanner.Text()
 			if flags.reverseMode {
-				line = replaceTokens(line, flags.uppercase)
+				line = cat.ReplaceTokens(line, flags.uppercase, hashmap)
 			} else {
-				line = replaceSymbols(line)
+				line = cat.ReplaceHashes(line)
 			}
 			// print out the line
 			if _, err := fmt.Println(line); err != nil {
 				fmt.Fprintln(os.Stderr, "Error writing to stdout:", err)
+				os.Exit(1)
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			fmt.Fprintln(os.Stderr, "reading file:", err)
-		}
-	}
-}
-
-// replaceSymbols replaces all (known) symbol hashes in a line with their token representation.
-func replaceSymbols(line string) string {
-	matches := symbolPattern.FindAllString(line, -1)
-	replacements := make([]string, 0, len(matches)*2)
-	for _, match := range matches {
-		replacement := evr.ToSymbol(match).Token().String()
-		if !strings.HasPrefix(replacement, "0x") {
-			replacements = append(replacements, match, replacement)
-		}
-	}
-	line = strings.NewReplacer(replacements...).Replace(line)
-	return line
-}
-
-// replaceTokens replaces all tokens in a line with their hashed representation.
-func replaceTokens(line string, uppercase bool) string {
-	tokens := strings.Split(line, " ")
-	hashes := make([]string, 0, len(tokens))
-	for _, t := range tokens {
-		if len(t) == 0 {
+			fmt.Fprintln(os.Stderr, "Error reading file:", err)
 			continue
 		}
-		sym := evr.ToSymbol(t)
-		s := sym.HexString()
-		if uppercase {
-			s = strings.ToUpper(s)
+
+		if db != nil {
+			if err := db.Sync(); err != nil {
+				fmt.Fprintln(os.Stderr, "Error syncing database:", err.Error())
+			}
 		}
-		hashes = append(hashes, s)
 	}
-	return strings.Join(hashes, " ")
+	// If reversing values, then update the cache with new values
+	if flags.updateDB && flags.reverseMode {
+		if err := updateDB(db, hashmap); err != nil {
+			fmt.Fprintln(os.Stderr, "Error updating database:", err.Error())
+		}
+	}
+	if err := closeDB(db); err != nil {
+		fmt.Fprintln(os.Stderr, "Error closing database:", err.Error())
+	}
+}
+
+func openDB(path string) (*bolt.DB, error) {
+	// Translate the path to an absolute path, including home directory expansion
+	path = filepath.Clean(path)
+	if path[:2] == "~/" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get home directory: %w", err)
+		}
+		path = filepath.Join(home, path[2:])
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return nil, fmt.Errorf("failed to create directory: %w", err)
+		}
+	}
+
+	db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	return db, nil
+}
+
+func readDB(db *bolt.DB) (map[evr.Symbol]evr.SymbolToken, error) {
+	hashes := make(map[evr.Symbol]evr.SymbolToken)
+	err := db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(HashBucketName)
+		if bucket == nil {
+			// Database doesn't exist (yet)
+			return nil
+		}
+
+		return bucket.ForEach(func(k, v []byte) error {
+			hash := binary.LittleEndian.Uint64(k)
+			token := evr.SymbolToken(v)
+			hashes[evr.Symbol(hash)] = token
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read database: %w", err)
+	}
+
+	return hashes, nil
+}
+
+func updateDB(db *bolt.DB, hashes map[evr.Symbol]evr.SymbolToken) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists(HashBucketName)
+		if err != nil {
+			return fmt.Errorf("failed to create bucket: %w", err)
+		}
+
+		for hash, token := range hashes {
+			b := make([]byte, 8)
+			binary.LittleEndian.PutUint64(b, uint64(hash))
+			if err := bucket.Put(b, []byte(token)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func closeDB(db *bolt.DB) error {
+	if db == nil {
+		return nil
+	}
+	return db.Close()
 }
