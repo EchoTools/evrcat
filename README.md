@@ -2,14 +2,12 @@
 
 `evrcat` finds all hex strings of known EchoVR symbols into their string representation. It uses the symbol cache of <https://github.com/echotools/nakama>.
 
-
 ## Usage
-
-
 
 ## Example
 
 It translates this:
+
 ```log
 [NETLOBBY] Starting session (gametype 0x33BBF6842DF97A3F, level 0xEA49CDE332AA536F)
 Dedicated: beginning session

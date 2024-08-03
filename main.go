@@ -41,10 +41,10 @@ func parseFlags() {
 	// Initialize flags
 	flag.BoolVar(&flags.showHelp, "help", false, "Display help information")
 	flag.BoolVar(&flags.reverseMode, "reverse", false, "Replace tokens with hashes")
-	flag.StringVar(&flags.databasePath, "db-path", "~/.cache/evrcat/lookup.db", "Path to the cache database file")
+	flag.StringVar(&flags.databasePath, "db-path", "~/.cache/evrcat/lookup.db", "load cache database from `PATH`")
 	flag.BoolVar(&flags.updateDB, "update-db", false, "Update the database (only works with --reverse)")
 	flag.BoolVar(&flags.uppercase, "uppercase", false, "Use uppercase hexadecimal strings")
-	flag.StringVar(&flags.serverListenPort, "server", "", "Run as a server on PORT (reverse not supported)")
+	flag.StringVar(&flags.serverListenPort, "server", "", "Run as a server on `PORT` (reverse not supported)")
 	flag.BoolVar(&flags.showVersion, "version", false, "Display version")
 	flag.Parse()
 
@@ -100,10 +100,7 @@ func main() {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error reading database:", err.Error())
 		}
-
-		fmt.Fprintln(os.Stderr, "Using database at", flags.databasePath)
-		fmt.Printf("Database contains %d entries\n", len(hashmap))
-
+		fmt.Fprintf(os.Stderr, "Loaded %d entries from %s\n", len(hashmap), flags.databasePath)
 	}
 
 	c := make(chan os.Signal, 1)
